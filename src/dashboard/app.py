@@ -2,11 +2,16 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import json
+import os
 from datetime import timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from src.ingestion.metrics_generator import generate_infrastructure_metrics, save_to_sqlite
 from src.features.feature_engineer import engineer_features, save_features
 from src.models.ensemble import predict as ensemble_predict
+from src.reasoning.rag_engine import analyze_anomaly, build_knowledge_base
 
 st.set_page_config(
     page_title="IOCC — Intelligent Operations Command Center",
@@ -17,6 +22,7 @@ st.set_page_config(
 
 DB_PATH = "data/iocc.db"
 MODEL_DIR = "data/models"
+CHROMA_PATH = "data/chroma"
 
 
 def load_raw() -> pd.DataFrame:
@@ -51,11 +57,9 @@ def get_predictions() -> pd.DataFrame:
     features = load_features_df()
     preds = ensemble_predict(features, MODEL_DIR)
     preds = preds.rename(columns={"is_anomaly": "predicted_anomaly"})
-
     raw = load_raw()[["timestamp", "cpu_percent", "memory_percent", "latency_p95_ms",
                        "error_rate", "container_restarts", "is_anomaly", "anomaly_type"]]
     raw = raw.rename(columns={"is_anomaly": "ground_truth_anomaly"})
-
     merged = preds.merge(raw, on="timestamp", how="left")
     merged["ground_truth_anomaly"] = merged["ground_truth_anomaly"].fillna(0).astype(int)
     merged["anomaly_type"] = merged["anomaly_type"].fillna("normal")
@@ -131,7 +135,6 @@ def command_center(df: pd.DataFrame, hours: int, threshold: float):
 
     st.divider()
     st.markdown("### Real-Time Metrics")
-
     col_left, col_right = st.columns(2)
     with col_left:
         st.markdown("**CPU & Memory %**")
@@ -143,7 +146,6 @@ def command_center(df: pd.DataFrame, hours: int, threshold: float):
         st.line_chart(window.set_index("timestamp")[["error_rate"]].tail(500), height=200)
         st.markdown("**Ensemble Anomaly Score**")
         st.line_chart(window.set_index("timestamp")[["ensemble_score"]].tail(500), height=200)
-
     return window
 
 
@@ -156,7 +158,6 @@ def anomaly_explorer(window: pd.DataFrame, threshold: float):
         return
 
     st.markdown(f"**{len(flagged)} anomalies detected** — sorted by severity")
-
     display_cols = ["timestamp", "ensemble_score", "ae_score", "iso_score",
                     "cpu_percent", "memory_percent", "latency_p95_ms",
                     "error_rate", "container_restarts", "anomaly_type"]
@@ -173,6 +174,96 @@ def anomaly_explorer(window: pd.DataFrame, threshold: float):
         st.dataframe(type_counts.rename("count").reset_index())
     with col2:
         st.bar_chart(type_counts)
+
+
+def llm_reasoning(df: pd.DataFrame, threshold: float):
+    st.markdown("## 🤖 LLM Root Cause Analysis")
+
+    if not os.path.exists(f"{CHROMA_PATH}/chroma.sqlite3"):
+        st.warning("Knowledge base not built yet.")
+        if st.button("Build Knowledge Base"):
+            with st.spinner("Building..."):
+                build_knowledge_base(CHROMA_PATH)
+            st.success("Knowledge base ready.")
+            st.rerun()
+        return
+
+    flagged = df[df["ensemble_score"] >= threshold].sort_values("ensemble_score", ascending=False)
+    if flagged.empty:
+        st.info("No anomalies detected to analyze.")
+        return
+
+    top = flagged.head(20)
+    options = [
+        f"{row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} | score={row['ensemble_score']:.3f} | {row['anomaly_type']}"
+        for _, row in top.iterrows()
+    ]
+    selected = st.selectbox("Select an anomaly to analyze:", options)
+    idx = options.index(selected)
+    row = top.iloc[idx]
+
+    anomaly_context = {
+        "timestamp": str(row["timestamp"]),
+        "anomaly_type": row["anomaly_type"],
+        "ensemble_score": float(row["ensemble_score"]),
+        "cpu_percent": float(row["cpu_percent"]),
+        "memory_percent": float(row["memory_percent"]),
+        "latency_p95_ms": float(row["latency_p95_ms"]),
+        "error_rate": float(row["error_rate"]),
+        "container_restarts": int(row["container_restarts"]),
+    }
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("CPU %", f"{anomaly_context['cpu_percent']:.1f}%")
+    col2.metric("Memory %", f"{anomaly_context['memory_percent']:.1f}%")
+    col3.metric("Latency p95", f"{anomaly_context['latency_p95_ms']:.0f}ms")
+    col4.metric("Error Rate", f"{anomaly_context['error_rate']:.3%}")
+
+    if st.button("Analyze with AI", type="primary"):
+        with st.spinner("Retrieving similar incidents and generating root cause analysis..."):
+            result = analyze_anomaly(anomaly_context, CHROMA_PATH)
+
+        source_label = "Claude AI" if result.get("source") == "claude" else "Rule-Based Engine"
+        impact_colors = {"low": "#22c55e", "medium": "#f59e0b", "high": "#ef4444", "critical": "#7c3aed"}
+        impact = result.get("estimated_impact", "medium")
+        impact_color = impact_colors.get(impact, "#6b7280")
+
+        st.markdown(
+            f'<div style="background:#1e293b;border-radius:12px;padding:20px;margin:1rem 0">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">'
+            f'<span style="font-size:1.1rem;font-weight:700;color:#f1f5f9">Root Cause Analysis</span>'
+            f'<span style="background:#334155;padding:3px 10px;border-radius:8px;font-size:0.75rem;color:#94a3b8">{source_label}</span>'
+            f'</div>'
+            f'<div style="font-size:1rem;font-weight:600;color:#60a5fa;margin-bottom:8px">'
+            f'{result["root_cause_classification"].replace("_", " ").title()}</div>'
+            f'<div style="color:#cbd5e1;font-size:0.9rem;margin-bottom:12px">{result["root_cause_explanation"]}</div>'
+            f'<div style="display:flex;gap:16px">'
+            f'<span style="color:#94a3b8;font-size:0.8rem">Confidence: <strong style="color:#f1f5f9">{result["confidence_score"]:.0%}</strong></span>'
+            f'<span style="color:#94a3b8;font-size:0.8rem">Impact: <strong style="color:{impact_color}">{impact.upper()}</strong></span>'
+            f'<span style="color:#94a3b8;font-size:0.8rem">Est. Resolution: <strong style="color:#f1f5f9">{result["estimated_resolution_minutes"]} min</strong></span>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        col_ev, col_act = st.columns(2)
+        with col_ev:
+            st.markdown("**Supporting Evidence**")
+            for e in result.get("supporting_evidence", []):
+                st.markdown(f"- {e}")
+
+        with col_act:
+            st.markdown("**Recommended Actions**")
+            for i, a in enumerate(result.get("recommended_actions", []), 1):
+                st.markdown(f"{i}. {a}")
+
+        similar = result.get("similar_incidents", [])
+        if similar:
+            st.markdown("**Similar Historical Incidents**")
+            for inc in similar:
+                with st.expander(f"{inc['title']} (similarity: {inc['similarity_score']:.2f})"):
+                    st.markdown(f"**Root Cause:** {inc['root_cause']}")
+                    st.markdown(f"**Resolution:** {inc['resolution']}")
+                    st.markdown(f"**Impact:** {inc['impact']} | **Duration:** {inc['duration_minutes']} minutes")
 
 
 def system_health(df: pd.DataFrame):
@@ -215,14 +306,18 @@ def system_health(df: pd.DataFrame):
 def main():
     hours, threshold = sidebar()
     df = get_predictions()
-    tab1, tab2, tab3 = st.tabs(["Command Center", "Anomaly Explorer", "System Health"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Command Center", "Anomaly Explorer", "LLM Analysis", "System Health"])
     with tab1:
-        window = command_center(df, hours, threshold)
+        command_center(df, hours, threshold)
     with tab2:
         cutoff = df["timestamp"].max() - timedelta(hours=hours)
         window_full = df[df["timestamp"] >= cutoff].copy()
         anomaly_explorer(window_full, threshold)
     with tab3:
+        cutoff = df["timestamp"].max() - timedelta(hours=hours)
+        window_full = df[df["timestamp"] >= cutoff].copy()
+        llm_reasoning(window_full, threshold)
+    with tab4:
         system_health(df)
 
 
