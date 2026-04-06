@@ -177,6 +177,9 @@ def anomaly_explorer(window: pd.DataFrame, threshold: float):
 
 
 def llm_reasoning(df: pd.DataFrame, threshold: float):
+    from src.evaluation.feedback_store import submit_feedback, get_feedback_summary, init_feedback_table
+    init_feedback_table()
+
     st.markdown("## 🤖 LLM Root Cause Analysis")
 
     if not os.path.exists(f"{CHROMA_PATH}/chroma.sqlite3"):
@@ -222,6 +225,12 @@ def llm_reasoning(df: pd.DataFrame, threshold: float):
     if st.button("Analyze with AI", type="primary"):
         with st.spinner("Retrieving similar incidents and generating root cause analysis..."):
             result = analyze_anomaly(anomaly_context, CHROMA_PATH)
+        st.session_state["last_analysis"] = result
+        st.session_state["last_anomaly"] = anomaly_context
+
+    if "last_analysis" in st.session_state:
+        result = st.session_state["last_analysis"]
+        anomaly_ctx = st.session_state["last_anomaly"]
 
         source_label = "Claude AI" if result.get("source") == "claude" else "Rule-Based Engine"
         impact_colors = {"low": "#22c55e", "medium": "#f59e0b", "high": "#ef4444", "critical": "#7c3aed"}
@@ -250,7 +259,6 @@ def llm_reasoning(df: pd.DataFrame, threshold: float):
             st.markdown("**Supporting Evidence**")
             for e in result.get("supporting_evidence", []):
                 st.markdown(f"- {e}")
-
         with col_act:
             st.markdown("**Recommended Actions**")
             for i, a in enumerate(result.get("recommended_actions", []), 1):
@@ -264,6 +272,55 @@ def llm_reasoning(df: pd.DataFrame, threshold: float):
                     st.markdown(f"**Root Cause:** {inc['root_cause']}")
                     st.markdown(f"**Resolution:** {inc['resolution']}")
                     st.markdown(f"**Impact:** {inc['impact']} | **Duration:** {inc['duration_minutes']} minutes")
+
+        st.divider()
+        st.markdown("### Rate This Analysis")
+        st.caption("Your ratings feed back into model improvement tracking.")
+
+        r1, r2, r3 = st.columns(3)
+        accuracy = r1.slider("Accuracy", 1, 5, 3, key="accuracy_slider")
+        actionability = r2.slider("Actionability", 1, 5, 3, key="actionability_slider")
+        completeness = r3.slider("Completeness", 1, 5, 3, key="completeness_slider")
+
+        root_cause_options = [
+            "cascade_failure", "cpu_saturation", "memory_exhaustion",
+            "latency_degradation", "error_storm", "network_issue", "unknown"
+        ]
+        predicted = result["root_cause_classification"]
+        correction = st.selectbox(
+            "Correct root cause (if different):",
+            root_cause_options,
+            index=root_cause_options.index(predicted) if predicted in root_cause_options else 0,
+            key="correction_select"
+        )
+        notes = st.text_input("Notes (optional):", key="operator_notes")
+
+        if st.button("Submit Feedback", type="secondary"):
+            submit_feedback(
+                anomaly_timestamp=anomaly_ctx["timestamp"],
+                anomaly_type=anomaly_ctx["anomaly_type"],
+                ensemble_score=anomaly_ctx["ensemble_score"],
+                predicted_root_cause=predicted,
+                accuracy_rating=accuracy,
+                actionability_rating=actionability,
+                completeness_rating=completeness,
+                corrected_root_cause=correction if correction != predicted else None,
+                operator_notes=notes if notes else None,
+                source=result.get("source", "rule_based"),
+            )
+            st.success("Feedback submitted. This will be used for model improvement tracking.")
+
+        st.divider()
+        st.markdown("### Feedback Summary")
+        summary = get_feedback_summary()
+        if summary["total_ratings"] > 0:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Ratings", summary["total_ratings"])
+            m2.metric("Avg Accuracy", f"{summary['avg_accuracy']:.1f}/5")
+            m3.metric("Avg Actionability", f"{summary['avg_actionability']:.1f}/5")
+            m4.metric("Correction Rate", f"{summary['correction_rate']:.1f}%")
+        else:
+            st.info("No feedback submitted yet.")
 
 
 def system_health(df: pd.DataFrame):
