@@ -306,7 +306,9 @@ def system_health(df: pd.DataFrame):
 def main():
     hours, threshold = sidebar()
     df = get_predictions()
-    tab1, tab2, tab3, tab4 = st.tabs(["Command Center", "Anomaly Explorer", "LLM Analysis", "System Health"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Command Center", "Anomaly Explorer", "LLM Analysis", "Cost Impact", "System Health"
+    ])
     with tab1:
         command_center(df, hours, threshold)
     with tab2:
@@ -318,8 +320,70 @@ def main():
         window_full = df[df["timestamp"] >= cutoff].copy()
         llm_reasoning(window_full, threshold)
     with tab4:
+        cutoff = df["timestamp"].max() - timedelta(hours=hours)
+        window_full = df[df["timestamp"] >= cutoff].copy()
+        cost_impact_panel(window_full, threshold)
+    with tab5:
         system_health(df)
 
 
 if __name__ == "__main__":
     main()
+
+
+if __name__ == "__main__":
+    main()
+
+
+def cost_impact_panel(df: pd.DataFrame, threshold: float):
+    from src.models.cost_estimator import estimate_batch, estimate_cost_impact
+
+    st.markdown("## 💰 Cost Impact Estimation")
+    flagged = df[df["ensemble_score"] >= threshold].copy()
+
+    if flagged.empty:
+        st.success("No anomalies detected — no cost impact estimated.")
+        return
+
+    cost_df = estimate_batch(flagged)
+
+    total_cost = cost_df["total_estimated_cost_usd"].sum()
+    total_avoided = cost_df["cost_avoided_by_early_detection_usd"].sum()
+    avg_sla_prob = cost_df["sla_breach_probability"].mean()
+    n_anomalies = len(cost_df)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Estimated Cost", f"${total_cost:,.0f}")
+    c2.metric("Cost Avoided by IOCC", f"${total_avoided:,.0f}", delta=f"+${total_avoided:,.0f} saved", delta_color="normal")
+    c3.metric("Avg SLA Breach Probability", f"{avg_sla_prob:.1%}")
+    c4.metric("Anomalies Priced", n_anomalies)
+
+    st.divider()
+    st.markdown("### Cost Breakdown by Anomaly")
+
+    display = cost_df[[
+        "timestamp", "anomaly_type", "ensemble_score",
+        "total_estimated_cost_usd", "cost_avoided_by_early_detection_usd",
+        "revenue_loss_usd", "engineering_cost_usd", "sla_penalty_usd",
+        "sla_breach_probability", "affected_users_pct"
+    ]].copy()
+    display["timestamp"] = pd.to_datetime(display["timestamp"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+    display["total_estimated_cost_usd"] = display["total_estimated_cost_usd"].map("${:,.0f}".format)
+    display["cost_avoided_by_early_detection_usd"] = display["cost_avoided_by_early_detection_usd"].map("${:,.0f}".format)
+    display["revenue_loss_usd"] = display["revenue_loss_usd"].map("${:,.0f}".format)
+    display["engineering_cost_usd"] = display["engineering_cost_usd"].map("${:,.0f}".format)
+    display["sla_penalty_usd"] = display["sla_penalty_usd"].map("${:,.0f}".format)
+    display["sla_breach_probability"] = display["sla_breach_probability"].map("{:.1%}".format)
+    display["affected_users_pct"] = display["affected_users_pct"].map("{:.1f}%".format)
+    st.dataframe(display.head(50), use_container_width=True)
+
+    st.markdown("### Cost by Anomaly Type")
+    type_cost = cost_df.groupby("anomaly_type")["total_estimated_cost_usd"].sum().sort_values(ascending=False)
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.dataframe(type_cost.reset_index().rename(columns={
+            "anomaly_type": "Type",
+            "total_estimated_cost_usd": "Total Cost ($)"
+        }))
+    with col2:
+        st.bar_chart(type_cost)
