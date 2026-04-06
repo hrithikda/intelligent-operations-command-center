@@ -22,3 +22,4 @@ mlruns/
 .pytest_cache/
 .coverage
 data/chroma/
+data/chroma/
