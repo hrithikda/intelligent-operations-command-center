@@ -21,3 +21,4 @@ mlruns/
 *.log
 .pytest_cache/
 .coverage
+data/chroma/
